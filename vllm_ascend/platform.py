@@ -624,7 +624,11 @@ class NPUPlatform(Platform):
             dict[str, Any]: _description_
         """
         # NOTE(Ronald1995): avoid circular import.
-        from vllm_ascend.ascend_forward_context import get_mc2_mask, select_moe_comm_method
+        from vllm_ascend.ascend_forward_context import (
+            _extract_num_actual_tokens,
+            get_mc2_mask,
+            select_moe_comm_method,
+        )
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
         from vllm.distributed import get_dp_group, get_tensor_model_parallel_world_size
 
@@ -648,8 +652,18 @@ class NPUPlatform(Platform):
 
         # is_draft_model will be removed later, so we set it to False temporarily.
         is_draft_model = False
+
+        # Prefer the real (un-padded) token count from attention metadata so
+        # that MoE communication selection and flashcomm bookkeeping are based
+        # on the true batch size, not the FIA / CUDA-graph padded value.
+        attn_num_actual_tokens = _extract_num_actual_tokens(attn_metadata)
+        if attn_num_actual_tokens is not None:
+            real_num_tokens = attn_num_actual_tokens
+        else:
+            real_num_tokens = num_tokens
+
         moe_comm_type = select_moe_comm_method(
-            num_tokens,
+            real_num_tokens,
             vllm_config,
             is_draft_model=is_draft_model,
         )
@@ -671,20 +685,20 @@ class NPUPlatform(Platform):
         # communication methods.
         mmrs_fusion = True
         if is_moe_model(vllm_config):
-            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
+            flash_comm_v1_enabled = enable_sp(vllm_config) and real_num_tokens is not None
             mmrs_fusion = False
         else:
-            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            flash_comm_v1_enabled = enable_sp(vllm_config) and real_num_tokens is not None and real_num_tokens > 1000
 
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
-        flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
+        flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and real_num_tokens is not None
         pad_size = 0
         padded_length = None
         if flash_comm_v1_enabled or flashcomm_v2_enabled:
             pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
 
         if num_tokens is None and attn_metadata is not None:
-            num_tokens = list(attn_metadata.values())[0].num_actual_tokens
+            num_tokens = attn_num_actual_tokens
         dp_world_size = get_dp_group().world_size
         if dp_world_size > 1 and dp_metadata is not None:
             max_tokens_across_dp = dp_metadata.max_tokens_across_dp_cpu.item()
@@ -695,7 +709,7 @@ class NPUPlatform(Platform):
             max_tokens_across_dp = num_tokens
         mc2_mask = None
         if num_tokens is not None:
-            num_actual_tokens = num_tokens
+            num_actual_tokens = real_num_tokens
             # NOTE: token num which need to pad to when mc2
             padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()

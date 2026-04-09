@@ -29,6 +29,24 @@ class MoECommType(Enum):
     FUSED_MC2 = 3
 
 
+def _extract_num_actual_tokens(attn_metadata: Any) -> int | None:
+    """Extract num_actual_tokens from attention metadata.
+
+    Handles both flat metadata objects and dict-of-metadata (per-layer)
+    structures that some multi-attention models use.
+    """
+    if attn_metadata is None:
+        return None
+    if hasattr(attn_metadata, "num_actual_tokens"):
+        return attn_metadata.num_actual_tokens
+    if isinstance(attn_metadata, dict):
+        for value in attn_metadata.values():
+            num_actual = _extract_num_actual_tokens(value)
+            if num_actual is not None:
+                return num_actual
+    return None
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -65,7 +83,20 @@ def set_ascend_forward_context(
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
-        max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
+        # Prefer the real (un-padded) token count from attention metadata so
+        # that MoE communication selection and flashcomm bookkeeping are based
+        # on the true batch size, not the FIA / CUDA-graph padded value.
+        attn_num_actual_tokens = _extract_num_actual_tokens(attn_metadata)
+        if attn_num_actual_tokens is not None:
+            real_num_tokens = attn_num_actual_tokens
+        elif num_actual_tokens is not None:
+            real_num_tokens = num_actual_tokens
+        else:
+            real_num_tokens = num_tokens
+
+        max_num_tokens = (
+            int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else real_num_tokens
+        )
         moe_comm_type = select_moe_comm_method(max_num_tokens, vllm_config, is_draft_model)
 
         forward_context.moe_comm_type = moe_comm_type
@@ -92,19 +123,19 @@ def set_ascend_forward_context(
         # main model and drafter model may have different architecture
         is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
         if is_context_moe_model:
-            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
+            flash_comm_v1_enabled = enable_sp(vllm_config) and real_num_tokens is not None
             mmrs_fusion = False
         elif is_draft_model:
             # TODO: for dense drafter, `sp` is redundant and is not compatible with `dp` and `graph`.
             # Disable it to avoid more problems.
             flash_comm_v1_enabled = False
         else:
-            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            flash_comm_v1_enabled = enable_sp(vllm_config) and real_num_tokens is not None and real_num_tokens > 1000
         forward_context.mmrs_fusion = mmrs_fusion
         forward_context.num_tokens = num_tokens
         forward_context.flash_comm_v1_enabled = flash_comm_v1_enabled
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
-        forward_context.flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
+        forward_context.flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and real_num_tokens is not None
 
         forward_context.pad_size = 0
         if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
@@ -126,7 +157,7 @@ def set_ascend_forward_context(
         forward_context.is_draft_model = is_draft_model
 
         if num_tokens is None and attn_metadata is not None:
-            num_tokens = attn_metadata.num_actual_tokens
+            num_tokens = attn_num_actual_tokens
 
         dp_world_size = get_dp_group().world_size
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
@@ -144,7 +175,7 @@ def set_ascend_forward_context(
 
         if num_tokens is not None:
             if num_actual_tokens is None:
-                num_actual_tokens = num_tokens
+                num_actual_tokens = real_num_tokens
             # NOTE: token num which need to pad to when mc2
             forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()
