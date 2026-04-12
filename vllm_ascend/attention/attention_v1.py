@@ -393,6 +393,44 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )
         self.sinks = sinks
 
+        # FIA requires query_rope/key_rope when head_dim is large with partial
+        # RoPE (e.g. Gemma 4 full_attention layers with global_head_dim=512 and
+        # partial_rotary_factor=0.25).  The operator mandates non-null rope
+        # tensors for D=512 in TND layout.
+        self._fia_rope_dim = 0
+        self._fia_rope_half_dim = 0
+        hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
+        if hf_text_config is not None:
+            rope_parameters = getattr(hf_text_config, "rope_parameters", None) or {}
+            full_attention_rope = rope_parameters.get("full_attention", {})
+            partial_rotary_factor = full_attention_rope.get("partial_rotary_factor", 1.0)
+            global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+            if global_head_dim == self.head_size and 0.0 < partial_rotary_factor < 1.0:
+                rope_dim = int(self.head_size * partial_rotary_factor)
+                if 0 < rope_dim < self.head_size and rope_dim % 2 == 0:
+                    self._fia_rope_dim = rope_dim
+                    self._fia_rope_half_dim = rope_dim // 2
+
+    def _split_rope_nope(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split a head-dimension tensor into NoPE and RoPE parts.
+
+        Assumes NeoX-style interleaved layout where RoPE dims occupy the first
+        ``rope_half_dim`` elements of each half of the head dimension.
+        """
+        half_dim = tensor.shape[-1] // 2
+        rope_half_dim = self._fia_rope_half_dim
+        first_half = tensor[..., :half_dim]
+        second_half = tensor[..., half_dim:]
+        rope = torch.cat(
+            (first_half[..., :rope_half_dim], second_half[..., :rope_half_dim]),
+            dim=-1,
+        ).contiguous()
+        nope = torch.cat(
+            (first_half[..., rope_half_dim:], second_half[..., rope_half_dim:]),
+            dim=-1,
+        ).contiguous()
+        return nope, rope
+
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -819,6 +857,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+        # When FIA requires query_rope/key_rope (head_dim=512 with partial
+        # RoPE), split Q and K into NoPE (content) and RoPE (positional) parts.
+        query_rope = None
+        key_rope = None
+        if self._fia_rope_dim > 0:
+            query, query_rope = self._split_rope_nope(query)
+            if (
+                attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+                and self.attn_type != AttentionType.ENCODER_DECODER
+            ):
+                key, key_rope = self._split_rope_nope(key)
+            else:
+                # For cached states, split from 4D paged KV cache directly.
+                assert self.key_cache is not None
+                key, key_rope = self._split_rope_nope(self.key_cache)
+                key = key.reshape(key.shape[0], key.shape[1], -1).contiguous()
+                key_rope = key_rope.reshape(key_rope.shape[0], key_rope.shape[1], -1).contiguous()
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
@@ -834,6 +889,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query,
                 key,
                 value,
+                query_rope=query_rope,
+                key_rope=key_rope,
                 num_query_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
                 input_layout="TND",
@@ -853,6 +910,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query=query,
                 key=key,
                 value=value,
+                query_rope=query_rope,
+                key_rope=key_rope,
                 atten_mask=attn_metadata.attn_mask,
                 block_table=block_table,
                 input_layout="TND",
